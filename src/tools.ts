@@ -55,6 +55,29 @@ export function buildToolDefs(webSearchEnabled: boolean) {
         parameters: { type: "object", properties: {} },
       },
     },
+    {
+      type: "function",
+      function: {
+        name: "run_checks",
+        description:
+          "Verify your own work by running project checks (build / typecheck / test) inside workspace_root. " +
+          "This does NOT run arbitrary commands -- only these three fixed, safe checks. Use this before declaring " +
+          `a coding task done, and to see whether a fix actually worked. Capped at ${MAX_CHECKS_PER_TASK} uses per ` +
+          "task -- if checks still fail after that, STOP and report the failure honestly instead of retrying " +
+          "the same thing again.",
+        parameters: {
+          type: "object",
+          properties: {
+            checks: {
+              type: "array",
+              items: { type: "string", enum: ["build", "typecheck", "test"] },
+              description: "Which checks to run. 'build' = npm run build, 'typecheck' = npx tsc --noEmit, 'test' = npm test.",
+            },
+          },
+          required: ["checks"],
+        },
+      },
+    },
   ];
   if (webSearchEnabled) {
     defs.push({
@@ -73,9 +96,22 @@ export function buildToolDefs(webSearchEnabled: boolean) {
   return defs;
 }
 
+export const MAX_CHECKS_PER_TASK = 4;
+const ALLOWED_CHECKS: Record<string, { cmd: string; args: string[]; timeoutMs: number }> = {
+  build: { cmd: "npm", args: ["run", "build"], timeoutMs: 120_000 },
+  typecheck: { cmd: "npx", args: ["tsc", "--noEmit"], timeoutMs: 60_000 },
+  test: { cmd: "npm", args: ["test"], timeoutMs: 120_000 },
+};
+
 export interface ToolContext {
   config: WorkerConfig;
   workspaceRoot: string;
+  // Mutable, one instance per delegate_task call (see ollama.ts) -- caps how
+  // many times run_checks can fire in a single task so a confused model
+  // can't loop "fix -> check -> fix -> check -> ..." forever. maxSteps in
+  // the outer tool-calling loop is a backstop too, but this gives a much
+  // tighter, purpose-specific limit and a clearer message when it's hit.
+  checksUsed: { count: number };
 }
 
 export async function executeTool(name: string, args: any, ctx: ToolContext): Promise<string> {
@@ -103,9 +139,52 @@ export async function executeTool(name: string, args: any, ctx: ToolContext): Pr
     case "search_web": {
       return await searchWeb(args.query, args.limit || 5);
     }
+    case "run_checks": {
+      return await runChecks(args.checks, ctx);
+    }
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
+}
+
+async function runChecks(checks: string[], ctx: ToolContext): Promise<string> {
+  ctx.checksUsed.count++;
+  if (ctx.checksUsed.count > MAX_CHECKS_PER_TASK) {
+    return (
+      `ERROR: run_checks has already been called ${ctx.checksUsed.count - 1} times this task ` +
+      `(limit ${MAX_CHECKS_PER_TASK}). Stop retrying the same fix -- report the current failure and stop.`
+    );
+  }
+
+  const root = resolveSafePath(ctx.config, ctx.workspaceRoot, ".");
+  const results: string[] = [];
+
+  for (const check of checks) {
+    const spec = ALLOWED_CHECKS[check];
+    if (!spec) {
+      results.push(`${check}: ERROR unknown check (allowed: ${Object.keys(ALLOWED_CHECKS).join(", ")})`);
+      continue;
+    }
+    try {
+      const { stdout, stderr } = await execFileAsync(spec.cmd, spec.args, {
+        cwd: root,
+        timeout: spec.timeoutMs,
+        maxBuffer: 4 * 1024 * 1024,
+      });
+      const output = (stdout + stderr).trim();
+      results.push(`${check}: PASS${output ? "\n" + truncate(output) : ""}`);
+    } catch (e: any) {
+      const output = ((e.stdout || "") + (e.stderr || "") || e.message || String(e)).trim();
+      results.push(`${check}: FAIL\n${truncate(output)}`);
+    }
+  }
+
+  appendLog(`RUN_CHECKS [${checks.join(",")}] workspace_root=${ctx.workspaceRoot} (use ${ctx.checksUsed.count}/${MAX_CHECKS_PER_TASK})`);
+  return results.join("\n\n");
+}
+
+function truncate(s: string, max = 4000): string {
+  return s.length > max ? s.slice(0, max) + `\n... (truncated, ${s.length - max} more chars)` : s;
 }
 
 // Reuses the same well-tested no-API-key search backend as the Continue MCP

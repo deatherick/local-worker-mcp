@@ -7,6 +7,13 @@ interface RunTaskParams {
   model?: string;
   think?: boolean;
   maxSteps?: number;
+  /** Called after every model turn and every tool execution, so the caller
+   * (the MCP server) can forward an MCP progress notification -- otherwise
+   * the calling client (e.g. Claude Code) sees no activity for the whole
+   * duration of a multi-step task and can time out waiting, even though the
+   * worker is actively making progress. See server.ts's delegate_task
+   * handler for how this gets wired to extra.sendNotification. */
+  onProgress?: (message: string) => void;
 }
 
 interface RunTaskResult {
@@ -32,7 +39,7 @@ export async function runDelegatedTask(config: WorkerConfig, params: RunTaskPara
   const think = params.think ?? config.defaultThink;
   const maxSteps = params.maxSteps ?? 8;
   const tools = buildToolDefs(config.webSearchEnabled);
-  const ctx: ToolContext = { config, workspaceRoot: params.workspaceRoot };
+  const ctx: ToolContext = { config, workspaceRoot: params.workspaceRoot, checksUsed: { count: 0 } };
 
   const messages: any[] = [
     {
@@ -45,6 +52,7 @@ export async function runDelegatedTask(config: WorkerConfig, params: RunTaskPara
   const metrics = { totalDurationMs: 0, loadDurationMs: 0, promptTokens: 0, outputTokens: 0 };
 
   for (let step = 0; step < maxSteps; step++) {
+    params.onProgress?.(`Step ${step + 1}/${maxSteps}: waiting on ${model}...`);
     const payload: any = {
       model,
       stream: false,
@@ -87,6 +95,7 @@ export async function runDelegatedTask(config: WorkerConfig, params: RunTaskPara
           /* leave as-is, executeTool will likely fail loudly, which is fine */
         }
       }
+      params.onProgress?.(`Step ${step + 1}/${maxSteps}: running tool "${toolName}"...`);
       let result: string;
       try {
         result = await executeTool(toolName, args, ctx);

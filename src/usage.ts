@@ -60,6 +60,7 @@ export interface UsageSummary {
   byModel: { model: string; calls: number; outputTokens: number }[];
   bySession: { sessionId: string; calls: number; outputTokens: number; projects: string[] }[];
   recent: UsageRecord[];
+  records: UsageRecord[];
 }
 
 /**
@@ -134,5 +135,7 @@ export function summarizeUsage(records: UsageRecord[]): UsageSummary {
       .map(([sessionId, v]) => ({ sessionId, calls: v.calls, outputTokens: v.outputTokens, projects: [...v.projects] }))
       .sort((a, b) => b.calls - a.calls),
     recent: records.slice(-20).reverse(),
+    // include the raw list so the frontend can do per-project filtering without asking the server
+    records,
   };
 }
