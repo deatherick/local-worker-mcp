@@ -9,11 +9,20 @@ export interface WorkerConfig {
   defaultThink: boolean;
   defaultCtx: number;
   defaultMaxTokens: number;
-  // Defense in depth: the worker can NEVER touch a path outside these roots,
-  // regardless of what the calling client passes as workspace_root. Empty
-  // by default -- you must explicitly opt a directory in via the config UI
-  // or this file before file tools do anything.
+  // Defense in depth: the worker can NEVER touch a path outside these roots
+  // or trustedParents (below), regardless of what the calling client passes
+  // as workspace_root. Empty by default -- you must explicitly opt a
+  // directory in via the config UI or this file before file tools do
+  // anything, UNLESS it falls under a trustedParent.
   allowedRoots: string[];
+  // Any subdirectory under one of these is auto-allowed without having to
+  // register it individually -- e.g. "/Users/you/code" so that every
+  // project you already keep there just works with whatever workspace_root
+  // your MCP client (Claude Code, etc.) passes, since it's the same
+  // directory tree the client itself is already trusted to work in. Add a
+  // path here deliberately; it's not a substitute for allowedRoots when you
+  // want to scope things tighter than "everything under this folder".
+  trustedParents: string[];
   webSearchEnabled: boolean;
 }
 
@@ -25,6 +34,7 @@ export const DEFAULT_CONFIG: WorkerConfig = {
   defaultCtx: 32768,
   defaultMaxTokens: 4096,
   allowedRoots: [],
+  trustedParents: [path.join(os.homedir(), "code")],
   webSearchEnabled: true,
 };
 
@@ -57,13 +67,16 @@ export function appendLog(line: string): void {
  * misbehaving or manipulated worker trying e.g. "../../../etc/passwd"). */
 export function resolveSafePath(cfg: WorkerConfig, workspaceRoot: string, relativePath: string): string {
   const root = path.resolve(workspaceRoot);
-  const isAllowed = cfg.allowedRoots.some((allowed) => {
-    const resolvedAllowed = path.resolve(allowed);
-    return root === resolvedAllowed || root.startsWith(resolvedAllowed + path.sep);
-  });
+  const underAny = (list: string[]) =>
+    list.some((allowed) => {
+      const resolvedAllowed = path.resolve(allowed);
+      return root === resolvedAllowed || root.startsWith(resolvedAllowed + path.sep);
+    });
+  const isAllowed = underAny(cfg.allowedRoots) || underAny(cfg.trustedParents);
   if (!isAllowed) {
     throw new Error(
-      `workspace_root "${root}" is not in allowedRoots. Add it via the config UI or ~/.local-worker-mcp/config.json first.`
+      `workspace_root "${root}" is not in allowedRoots or under a trustedParent. ` +
+      `Add it via the config UI or ~/.local-worker-mcp/config.json first.`
     );
   }
   const resolved = path.resolve(root, relativePath);

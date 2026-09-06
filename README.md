@@ -40,6 +40,13 @@ local-worker-mcp executes each tool call, scoped to workspace_root
   those folders -- empty by default, by design. You have to explicitly
   add folders via the dashboard or the config file before the worker can
   touch anything.
+- **`trustedParents`** is the ergonomic escape hatch for the above: any
+  subdirectory under one of these is auto-allowed without registering it
+  individually -- defaults to `~/code`, so any project you keep there
+  (and whatever `workspace_root` your MCP client passes for it, e.g. the
+  current Claude Code project directory) just works with zero manual
+  setup. Use `allowedRoots` instead when you want something scoped
+  tighter than "everything under this folder".
 - Every write (`write_file`) is logged to `~/.local-worker-mcp/activity.log`
   with the full path and size -- so you can audit what the model touched
   afterward.

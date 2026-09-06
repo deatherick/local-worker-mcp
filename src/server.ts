@@ -123,8 +123,10 @@ const DASHBOARD_HTML = `<!doctype html>
   <select name="defaultThink"><option value="false">false</option><option value="true">true</option></select>
   <label>Context length</label><input name="defaultCtx" type="number">
   <label>Max tokens per response</label><input name="defaultMaxTokens" type="number">
-  <label>Allowed roots (one per line, absolute paths)</label>
-  <textarea name="allowedRoots" rows="4"></textarea>
+  <label>Allowed roots (one per line, absolute paths -- exact folders)</label>
+  <textarea name="allowedRoots" rows="3"></textarea>
+  <label>Trusted parents (one per line -- any subfolder under these is auto-allowed, e.g. ~/code so every project there just works without listing each one)</label>
+  <textarea name="trustedParents" rows="3"></textarea>
   <label>Web search enabled</label>
   <select name="webSearchEnabled"><option value="true">true</option><option value="false">false</option></select>
   <button type="submit">Save</button>
@@ -136,7 +138,7 @@ const DASHBOARD_HTML = `<!doctype html>
     for (const [k, v] of Object.entries(cfg)) {
       const el = f.elements[k];
       if (!el) continue;
-      if (k === 'allowedRoots') el.value = v.join('\\n');
+      if (k === 'allowedRoots' || k === 'trustedParents') el.value = v.join('\\n');
       else if (el.tagName === 'SELECT') el.value = String(v);
       else el.value = v;
     }
@@ -151,6 +153,7 @@ const DASHBOARD_HTML = `<!doctype html>
       defaultCtx: Number(fd.get('defaultCtx')),
       defaultMaxTokens: Number(fd.get('defaultMaxTokens')),
       allowedRoots: String(fd.get('allowedRoots')).split('\\n').map(s => s.trim()).filter(Boolean),
+      trustedParents: String(fd.get('trustedParents')).split('\\n').map(s => s.trim()).filter(Boolean),
       webSearchEnabled: fd.get('webSearchEnabled') === 'true',
     };
     const r = await fetch('/api/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
