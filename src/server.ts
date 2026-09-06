@@ -115,19 +115,19 @@ const DASHBOARD_HTML = `<!doctype html>
   .hint { color: #666; font-size: 12px; }
 </style>
 <h1>local-worker-mcp</h1>
-<p class="hint">Config vive en <code>~/.local-worker-mcp/config.json</code>. Cambios aquí se guardan ahí directo.</p>
+<p class="hint">Config lives in <code>~/.local-worker-mcp/config.json</code>. Changes here are saved straight there.</p>
 <form id="f">
   <label>Ollama host</label><input name="ollamaHost">
-  <label>Modelo por default</label><input name="defaultModel">
-  <label>Thinking por default</label>
+  <label>Default model</label><input name="defaultModel">
+  <label>Default thinking</label>
   <select name="defaultThink"><option value="false">false</option><option value="true">true</option></select>
   <label>Context length</label><input name="defaultCtx" type="number">
-  <label>Max tokens por respuesta</label><input name="defaultMaxTokens" type="number">
-  <label>Allowed roots (uno por línea, rutas absolutas)</label>
+  <label>Max tokens per response</label><input name="defaultMaxTokens" type="number">
+  <label>Allowed roots (one per line, absolute paths)</label>
   <textarea name="allowedRoots" rows="4"></textarea>
-  <label>Web search habilitado</label>
+  <label>Web search enabled</label>
   <select name="webSearchEnabled"><option value="true">true</option><option value="false">false</option></select>
-  <button type="submit">Guardar</button>
+  <button type="submit">Save</button>
 </form>
 <p id="status"></p>
 <script>
@@ -154,7 +154,7 @@ const DASHBOARD_HTML = `<!doctype html>
       webSearchEnabled: fd.get('webSearchEnabled') === 'true',
     };
     const r = await fetch('/api/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
-    document.getElementById('status').textContent = r.ok ? 'Guardado.' : 'Error al guardar.';
+    document.getElementById('status').textContent = r.ok ? 'Saved.' : 'Error saving.';
   });
 </script>
 `;
