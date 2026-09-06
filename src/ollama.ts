@@ -13,6 +13,12 @@ interface RunTaskResult {
   finalText: string;
   steps: { tool: string; args: any; result: string }[];
   modelUsed: string;
+  metrics: {
+    totalDurationMs: number;
+    loadDurationMs: number;
+    promptTokens: number;
+    outputTokens: number;
+  };
 }
 
 /**
@@ -36,6 +42,7 @@ export async function runDelegatedTask(config: WorkerConfig, params: RunTaskPara
   ];
 
   const steps: RunTaskResult["steps"] = [];
+  const metrics = { totalDurationMs: 0, loadDurationMs: 0, promptTokens: 0, outputTokens: 0 };
 
   for (let step = 0; step < maxSteps; step++) {
     const payload: any = {
@@ -59,8 +66,13 @@ export async function runDelegatedTask(config: WorkerConfig, params: RunTaskPara
     const body: any = await resp.json();
     const msg = body.message;
 
+    metrics.totalDurationMs += (body.total_duration || 0) / 1e6;
+    metrics.loadDurationMs += (body.load_duration || 0) / 1e6;
+    metrics.promptTokens += body.prompt_eval_count || 0;
+    metrics.outputTokens += body.eval_count || 0;
+
     if (!msg.tool_calls || msg.tool_calls.length === 0) {
-      return { finalText: msg.content || "", steps, modelUsed: model };
+      return { finalText: msg.content || "", steps, modelUsed: model, metrics };
     }
 
     messages.push({ role: "assistant", content: msg.content || "", tool_calls: msg.tool_calls });
@@ -90,5 +102,6 @@ export async function runDelegatedTask(config: WorkerConfig, params: RunTaskPara
     finalText: "(hit maxSteps without a final answer -- see steps for what it was doing)",
     steps,
     modelUsed: model,
+    metrics,
   };
 }
