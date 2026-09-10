@@ -41,10 +41,47 @@ export function readUsage(): UsageRecord[] {
     .filter((r): r is UsageRecord => r !== null);
 }
 
-/** Human-friendly project label from a workspace_root path, e.g.
- * "/Users/x/code/cartograph" -> "cartograph". */
-function projectLabel(workspaceRoot: string): string {
-  return path.basename(workspaceRoot) || workspaceRoot;
+/** Walk up from `startDir` looking for a `.git` entry (dir or file -- git
+ * worktrees use a file), returning the first directory that has one, or
+ * null if none is found before the filesystem root. Memoized since the
+ * same workspaceRoot repeats across many usage records/active tasks. */
+const gitRootCache = new Map<string, string | null>();
+function findGitRoot(startDir: string): string | null {
+  if (gitRootCache.has(startDir)) return gitRootCache.get(startDir)!;
+  let dir = startDir;
+  let result: string | null = null;
+  while (true) {
+    try {
+      if (fs.existsSync(path.join(dir, ".git"))) {
+        result = dir;
+        break;
+      }
+    } catch {
+      break; // fail-safe: treat as "no git root found" rather than throwing
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break; // reached filesystem root
+    dir = parent;
+  }
+  gitRootCache.set(startDir, result);
+  return result;
+}
+
+/** Human-friendly, STABLE project label from a workspace_root path.
+ * Resolves to the nearest git repo root first (so the same project always
+ * groups together regardless of which subfolder a delegate_task call
+ * targeted), then uses the last two path segments of that root for
+ * disambiguation (e.g. "pokedex-median/webapp") so different projects
+ * sharing a leaf folder name don't collide. Falls back to the raw path's
+ * last two segments if no .git is found (e.g. not a git repo yet). */
+export function projectLabel(workspaceRoot: string): string {
+  const gitRoot = findGitRoot(workspaceRoot);
+  const base = gitRoot || workspaceRoot;
+  const cleaned = base.replace(/\/+$/, "");
+  const segments = cleaned.split("/").filter(Boolean);
+  if (segments.length === 0) return base || "/";
+  if (segments.length === 1) return segments[0];
+  return segments.slice(-2).join("/");
 }
 
 export interface UsageSummary {
@@ -59,8 +96,8 @@ export interface UsageSummary {
   byDay: { day: string; calls: number; outputTokens: number; promptTokens: number }[];
   byModel: { model: string; calls: number; outputTokens: number }[];
   bySession: { sessionId: string; calls: number; outputTokens: number; projects: string[] }[];
-  recent: UsageRecord[];
-  records: UsageRecord[];
+  recent: (UsageRecord & { project: string })[];
+  records: (UsageRecord & { project: string })[];
 }
 
 /**
@@ -134,8 +171,11 @@ export function summarizeUsage(records: UsageRecord[]): UsageSummary {
     bySession: [...bySessionMap.entries()]
       .map(([sessionId, v]) => ({ sessionId, calls: v.calls, outputTokens: v.outputTokens, projects: [...v.projects] }))
       .sort((a, b) => b.calls - a.calls),
-    recent: records.slice(-20).reverse(),
-    // include the raw list so the frontend can do per-project filtering without asking the server
-    records,
+    recent: records.slice(-20).reverse().map((r) => ({ ...r, project: projectLabel(r.workspaceRoot) })),
+    // include the raw list (with resolved `project`) so the frontend can do
+    // per-project filtering/re-aggregation without asking the server again
+    // and without needing filesystem access (git-root resolution can only
+    // happen here, server-side).
+    records: records.map((r) => ({ ...r, project: projectLabel(r.workspaceRoot) })),
   };
 }

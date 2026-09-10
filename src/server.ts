@@ -5,9 +5,53 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { loadConfig, saveConfig, WorkerConfig } from "./config.js";
 import { runDelegatedTask } from "./ollama.js";
-import { logUsage, readUsage, summarizeUsage } from "./usage.js";
+import { logUsage, readUsage, summarizeUsage, projectLabel } from "./usage.js";
+import { readCloudUsage, summarizeCloudUsage } from "./cloudUsage.js";
+import { getModelInfo } from "./modelInfo.js";
 
 let config = loadConfig();
+
+// ---------------------------------------------------------------------------
+// Active-task registry (in-memory only; live state resets on restart)
+// ---------------------------------------------------------------------------
+interface ActiveStep {
+  timestamp: string;
+  message: string;
+}
+
+interface ActiveTask {
+  id: string;
+  workspaceRoot: string;
+  model: string;
+  think: boolean;
+  startedAt: string;
+  lastUpdateAt: number; /* Date.now() at last progress push */
+  steps: ActiveStep[];
+}
+
+const activeTasks = new Map<string, ActiveTask>();
+
+// A single step's raw args/result can hold a whole file's contents (write_file,
+// read_file) or run_checks output -- across a multi-step task these add up fast
+// and can blow past the calling client's per-tool-result size limit (seen in
+// practice: a 13-step task returned a 144KB response). The foreman doesn't need
+// every byte back to review the work -- it can (and should) read the actual
+// files afterward -- so previews here, not full content.
+const STEP_PREVIEW_CHARS = 300;
+function truncatePreview(value: string, max: number): string {
+  return value.length > max ? `${value.slice(0, max)}... [truncated, ${value.length} chars total]` : value;
+}
+function previewSteps(steps: { tool: string; args: any; result: string }[]) {
+  return steps.map((s) => ({
+    tool: s.tool,
+    args: truncatePreview(JSON.stringify(s.args), STEP_PREVIEW_CHARS),
+    result: truncatePreview(s.result, STEP_PREVIEW_CHARS),
+  }));
+}
+
+// ---------------------------------------------------------------------------
+// MCP server builder
+// ---------------------------------------------------------------------------
 
 function buildMcpServer(getSessionId: () => string | undefined): McpServer {
   const server = new McpServer({ name: "local-worker-mcp", version: "0.1.0" });
@@ -32,6 +76,20 @@ function buildMcpServer(getSessionId: () => string | undefined): McpServer {
     },
     async ({ task, workspace_root, model, think, max_steps }, extra) => {
       const startedAt = new Date().toISOString();
+
+      // Register this call as an active task
+      const taskId = randomUUID();
+      const modelUsed = model || config.defaultModel;
+      activeTasks.set(taskId, {
+        id: taskId,
+        workspaceRoot: workspace_root,
+        model: modelUsed,
+        think: think ?? false,
+        startedAt,
+        lastUpdateAt: Date.now(),
+        steps: [],
+      });
+
       // Forward progress to the calling MCP client (only if it asked for it
       // by sending a progressToken) so it doesn't think this call is dead
       // during a long tool-calling loop -- found in practice: a real ~6-step
@@ -40,6 +98,13 @@ function buildMcpServer(getSessionId: () => string | undefined): McpServer {
       // actively working the whole time.
       const progressToken = extra._meta?.progressToken;
       const onProgress = progressToken === undefined ? undefined : (message: string) => {
+        /* Also record in the active-task registry so /api/active has data */
+        const task = activeTasks.get(taskId);
+        if (task) {
+          task.lastUpdateAt = Date.now();
+          task.steps.push({ timestamp: new Date().toISOString(), message });
+        }
+
         extra.sendNotification({
           method: "notifications/progress",
           params: { progressToken, progress: 0, message },
@@ -70,12 +135,16 @@ function buildMcpServer(getSessionId: () => string | undefined): McpServer {
           promptTokens: result.metrics.promptTokens,
           outputTokens: result.metrics.outputTokens,
         });
+
+        /* Clean up active registry */
+        activeTasks.delete(taskId);
+
         return {
           content: [
             {
               type: "text",
               text: JSON.stringify(
-                { finalText: result.finalText, modelUsed: result.modelUsed, steps: result.steps },
+                { finalText: result.finalText, modelUsed: result.modelUsed, steps: previewSteps(result.steps) },
                 null,
                 2
               ),
@@ -97,6 +166,10 @@ function buildMcpServer(getSessionId: () => string | undefined): McpServer {
           promptTokens: 0,
           outputTokens: 0,
         });
+
+        /* Clean up active registry */
+        activeTasks.delete(taskId);
+
         throw e;
       }
     }
@@ -159,12 +232,63 @@ app.get("/api/usage", (_req, res) => {
   res.json(summarizeUsage(readUsage()));
 });
 
+// ---- Cloud (Claude Code) usage API -- reads local session transcripts, no
+// active-session cooperation needed; see cloudUsage.ts for how/why. ----
+app.get("/api/cloud-usage", (_req, res) => {
+  res.json(summarizeCloudUsage(readCloudUsage()));
+});
+
+// ---- Model info API -- metadata only (no model load), always reflects
+// whatever is currently configured as defaultModel. ----
+app.get("/api/model-info", async (_req, res) => {
+  try {
+    res.json(await getModelInfo(config));
+  } catch (e: any) {
+    res.status(502).json({ error: e.message || String(e) });
+  }
+});
+
+// ---- Active (live tasks) API ----
+app.get("/api/active", (_req, res) => {
+  const now = Date.now();
+  const result: Array<{
+    id: string;
+    workspaceRoot: string;
+    project: string;
+    model: string;
+    think: boolean;
+    startedAt: string;
+    elapsedMs: number;
+    steps: ActiveStep[];
+  }> = [];
+
+  for (const task of activeTasks.values()) {
+    result.push({
+      id: task.id,
+      workspaceRoot: task.workspaceRoot,
+      project: projectLabel(task.workspaceRoot),
+      model: task.model,
+      think: task.think,
+      startedAt: task.startedAt,
+      elapsedMs: now - new Date(task.startedAt).getTime(),
+      steps: [...task.steps],
+    });
+  }
+
+  res.json(result);
+});
+
 // ---- Single-page dashboard shell ----
 app.get("/", (_req, res) => {
   res.type("html").send(APP_HTML);
 });
 app.get("/usage", (_req, res) => {
   // Alias: serve the same page but pre-select the Usage tab for backward compat.
+  res.type("html").send(APP_HTML);
+});
+app.get("/active", (_req, res) => {
+  // Alias: serve the same page but pre-select the Active tab (client-side already
+  // checks location.pathname === '/active' -- this route just makes that reachable).
   res.type("html").send(APP_HTML);
 });
 
@@ -177,11 +301,12 @@ const APP_HTML = `<!doctype html>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.5.1/chart.umd.min.js"></script>
 <style>
   :root { color-scheme: light dark; }
-  body { font: 14px -apple-system, sans-serif; max-width: 980px; margin: 0; padding: 0; background: #fff; color: #1a1a1a; }
+  html, body { margin: 0; padding: 0; }
+  body { font: 14px -apple-system, sans-serif; background: #fff; color: #1a1a1a; }
 
   /* Tab bar */
   .tab-bar { display: flex; border-bottom: 2px solid #ddd; position: sticky; top: 0; background: #fff; z-index: 10; }
-  @media (prefers-color-scheme: dark) { body { background: #14151a; color: #e8e8e8; } .tab-bar { border-bottom-color: #333; } .panel { background: #14151a; } label, th { color: #ccc !important; } }
+  @media (prefers-color-scheme: dark) { body { background: #14151a; color: #e8e8e8; } .tab-bar { border-bottom-color: #333; background: #14151a; } .panel { background: #14151a; } label, th { color: #ccc !important; } }
   .tab-btn { padding: 12px 24px; font-size: 14px; font-weight: 600; cursor: pointer; border: none; background: transparent; color: #888; border-bottom: 3px solid transparent; margin-bottom: -2px; transition: all .15s; }
   .tab-btn:hover { color: #444; }
   @media (prefers-color-scheme: dark) { .tab-btn:hover { color: #ccc; } }
@@ -236,6 +361,28 @@ const APP_HTML = `<!doctype html>
   @media (prefers-color-scheme: dark) { th, td { border-color: #333 !important; } th { color: #aaa !important; } }
   .fail { color: #c0392b; }
 
+  /* Active tab styles */
+  .project-row { cursor: pointer; transition: background .1s; }
+  .project-row:hover { background: #f0f0f0; }
+  @media (prefers-color-scheme: dark) { .project-row:hover { background: #2a2b34; } }
+  .status-badge { display: inline-block; min-width: 72px; }
+  .elapsed-text { color: #888; font-size: 12px; }
+
+  /* Detail panel (inline) */
+  .detail-panel { margin-top: 16px; padding: 16px; border-radius: 8px; border: 1px solid #ddd; display: none; }
+  @media (prefers-color-scheme: dark) { .detail-panel { border-color: #444; background: #1c1d24; } }
+  .detail-panel.visible { display: block; }
+  .detail-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+  .detail-close { cursor: pointer; color: #888; font-size: 18px; background: none; border: none; padding: 0 4px; }
+  @media (prefers-color-scheme: dark) { .detail-close { color: #aaa; } }
+  .step-list { list-style: none; margin: 0; padding: 0; }
+  .step-list li { padding: 4px 0; border-bottom: 1px solid #eee; font-size: 13px; font-family: monospace; }
+  @media (prefers-color-scheme: dark) { .step-list li { border-color: #333; } }
+
+  /* Active tab header */
+  .active-header { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+  .active-status-text { font-size: 13px; color: #888; }
+
   @media (max-width: 700px) { .charts { grid-template-columns: 1fr; } }
 </style>
 
@@ -244,6 +391,7 @@ const APP_HTML = `<!doctype html>
 <div class="tab-bar" id="tabBar">
   <button class="tab-btn active" data-tab="config">Config</button>
   <button class="tab-btn" data-tab="usage">Usage</button>
+  <button class="tab-btn" data-tab="active">Active</button>
 </div>
 
 <!-- Config panel -->
@@ -265,6 +413,9 @@ const APP_HTML = `<!doctype html>
     <button type="submit">Save</button>
   </form>
   <p id="configStatus"></p>
+
+  <h2>Model info <span class="hint">-- currently configured local model, updates if you change it</span></h2>
+  <div class="stats" id="modelInfoCards"><div class="stat"><span class="n">...</span><span class="l">Loading</span></div></div>
 </div>
 
 <!-- Usage panel -->
@@ -285,6 +436,13 @@ const APP_HTML = `<!doctype html>
     <div class="chart-box wide"><canvas id="chartByDay"></canvas></div>
   </div>
 
+  <h2>Claude (cloud) <span class="hint">-- from local Claude Code session transcripts on this machine, all projects</span></h2>
+  <div class="stats" id="cloudStatCards"></div>
+  <p class="hint">*Cloud total = input + output tokens only (excludes cache-read tokens, which are heavily-discounted context reuse and would otherwise dwarf everything).</p>
+  <div class="charts">
+    <div class="chart-box wide"><canvas id="chartLocalVsCloud"></canvas></div>
+  </div>
+
   <h2>By session</h2>
   <table><thead><tr><th>Session</th><th>Calls</th><th>Output tokens</th><th>Projects</th></tr></thead>
     <tbody id="sessionTable"></tbody>
@@ -296,30 +454,78 @@ const APP_HTML = `<!doctype html>
   </table>
 </div>
 
+<!-- Active panel -->
+<div class="panel" id="panel-active">
+  <h2>Live Activity <span class="live-dot" id="activeLiveDot" style="display:none;"></span></h2>
+  <p class="sub-hint">In-progress tasks and per-project idle/running status. Updates every ~2 seconds.</p>
+
+  <h3>All known projects</h3>
+  <table><thead><tr><th>Project</th><th>Status</th><th>Last used</th></tr></thead>
+    <tbody id="projectStatusTable"></tbody>
+  </table>
+
+  <div class="detail-panel" id="activeDetail">
+    <div class="detail-header">
+      <strong id="activeDetailTitle"></strong>
+      <span class="elapsed-text" id="activeDetailElapsed"></span>
+      <button class="detail-close" id="activeDetailClose" title="Close">&times;</button>
+    </div>
+    <ol class="step-list" id="activeDetailSteps"></ol>
+  </div>
+</div>
+
 <script>
 (function() {
   /* ---- Tab switching ---- */
   var tabBar = document.getElementById('tabBar');
-  var panels = { config: document.getElementById('panel-config'), usage: document.getElementById('panel-usage') };
+  var panels = { config: document.getElementById('panel-config'), usage: document.getElementById('panel-usage'), active: document.getElementById('panel-active') };
+  var TAB_PATHS = { config: '/', usage: '/usage', active: '/active' };
 
-  function showTab(name) {
+  /* updateUrl defaults to true (normal tab clicks push a new history
+   * entry so the URL always matches the visible tab -- reload or share the
+   * link and you land back on the same tab). Pass false for the initial
+   * render and for popstate handling, where the URL already reflects the
+   * tab we're about to show and pushing again would create a duplicate
+   * history entry / infinite loop. */
+  function showTab(name, updateUrl) {
     for (var n in panels) { panels[n].classList.remove('visible'); }
     tabBar.querySelectorAll('.tab-btn').forEach(function(btn) {
       btn.classList.toggle('active', btn.getAttribute('data-tab') === name);
     });
     panels[name].classList.add('visible');
+
+    if (updateUrl !== false && TAB_PATHS[name] && location.pathname !== TAB_PATHS[name]) {
+      history.pushState({ tab: name }, '', TAB_PATHS[name]);
+    }
+
+    /* Lazy-initialize charts when the Usage tab is shown for the first time */
+    if (name === 'usage' && !chartsReady) {
+      showTabUsage();
+    }
+
+    /* Initialize active-tab logic when that tab is shown */
+    if (name === 'active') {
+      initActiveTab();
+    }
   }
   tabBar.addEventListener('click', function(e) {
     var btn = e.target.closest('.tab-btn');
     if (!btn) return;
     showTab(btn.getAttribute('data-tab'));
   });
+  /* Back/forward browser buttons should switch tabs too, not just change
+   * the address bar -- re-derive the tab from the URL we just navigated to. */
+  window.addEventListener('popstate', function() {
+    if (location.pathname === '/usage') showTab('usage', false);
+    else if (location.pathname === '/active') showTab('active', false);
+    else showTab('config', false);
+  });
 
-  /* Determine which tab to start on based on URL */
-  (function() {
-    if (location.pathname === '/usage') showTab('usage');
-    else showTab('config');
-  })();
+  /* NOTE: which tab to start on (based on URL) is decided further down,
+   * AFTER the Usage-tab variables/functions below (PALETTE, _rawRecords,
+   * projectFilterSelect, showTabUsage, etc.) are declared -- showTab('usage')
+   * synchronously calls showTabUsage(), which reads all of those, so calling
+   * it here (before they exist) would throw on a direct /usage load. */
 
   /* ---- Config form loading/saving (unchanged semantics) ---- */
   var configForm = document.getElementById('configForm');
@@ -329,7 +535,7 @@ const APP_HTML = `<!doctype html>
     for (var key in cfg) {
       var el = configForm.elements[key];
       if (!el) continue;
-      if (key === 'allowedRoots' || key === 'trustedParents') el.value = cfg[key].join('\\\\n');
+      if (key === 'allowedRoots' || key === 'trustedParents') el.value = cfg[key].join('\\n');
       else if (el.tagName === 'SELECT') el.value = String(cfg[key]);
       else el.value = cfg[key] == null ? '' : String(cfg[key]);
     }
@@ -344,28 +550,171 @@ const APP_HTML = `<!doctype html>
       defaultThink: fd.get('defaultThink') === 'true',
       defaultCtx: Number(fd.get('defaultCtx')),
       defaultMaxTokens: Number(fd.get('defaultMaxTokens')),
-      allowedRoots: String(fd.get('allowedRoots')).split('\\\\n').map(function(s) { return s.trim(); }).filter(Boolean),
-      trustedParents: String(fd.get('trustedParents')).split('\\\\n').map(function(s) { return s.trim(); }).filter(Boolean),
+      allowedRoots: String(fd.get('allowedRoots')).split('\\n').map(function(s) { return s.trim(); }).filter(Boolean),
+      trustedParents: String(fd.get('trustedParents')).split('\\n').map(function(s) { return s.trim(); }).filter(Boolean),
       webSearchEnabled: fd.get('webSearchEnabled') === 'true',
     };
     fetch('/api/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) })
       .then(function(r) { return r.json(); }).then(function() {
         configStatus.textContent = 'Saved.';
+        fetchModelInfo(); /* defaultModel (or ctx) may have just changed -- refresh the card */
         setTimeout(function(){ configStatus.textContent = ''; }, 2000);
       });
   });
 
+  /* ---- Model info card: static metadata from Ollama (no model load) plus
+   * an avg tokens/sec figure computed from OUR OWN recent local usage
+   * records for that model (recomputed on every usage poll, no extra
+   * network call needed for that part). */
+  var _modelInfo = null;
+
+  function fetchModelInfo() {
+    return fetch('/api/model-info').then(function(r) { return r.json(); }).then(function(info) {
+      if (info && !info.error) {
+        _modelInfo = info;
+        renderModelInfoCard();
+      }
+    }).catch(function() { /* Ollama may be briefly unreachable -- leave last-known card as-is */ });
+  }
+
+  function computeAvgTokPerSec(records, modelName) {
+    var sumOut = 0, sumMs = 0;
+    for (var i = 0; i < records.length; i++) {
+      var r = records[i];
+      if (r.model !== modelName) continue;
+      var genMs = r.totalDurationMs - r.loadDurationMs;
+      if (genMs > 0) { sumOut += r.outputTokens; sumMs += genMs; }
+    }
+    return sumMs > 0 ? sumOut / (sumMs / 1000) : null;
+  }
+
+  function renderModelInfoCard() {
+    var el = document.getElementById('modelInfoCards');
+    if (!el || !_modelInfo) return;
+    var info = _modelInfo;
+    var avg = computeAvgTokPerSec((typeof _rawRecords !== 'undefined' && _rawRecords) || [], info.model);
+    var expertsText = (info.expertCount && info.expertUsedCount)
+      ? info.expertUsedCount + ' / ' + info.expertCount + ' experts per token (MoE)'
+      : 'dense (no MoE)';
+
+    el.innerHTML =
+      '<div class="stat highlight"><span class="n">' + info.model + '</span><span class="l">Model in use</span></div>' +
+      '<div class="stat"><span class="n">' + info.parameterSize + '</span><span class="l">Parameters</span></div>' +
+      '<div class="stat"><span class="n">' + info.quantization + '</span><span class="l">Quantization</span></div>' +
+      '<div class="stat"><span class="n">' + info.configuredCtx.toLocaleString() + '</span><span class="l">Context (max ' + info.maxContext.toLocaleString() + ')</span></div>' +
+      '<div class="stat"><span class="n">' + expertsText + '</span><span class="l">Architecture</span></div>' +
+      '<div class="stat"><span class="n">' + (avg ? avg.toFixed(1) + ' tok/s' : '\u2014') + '</span><span class="l">Avg. gen. speed (local calls this session)</span></div>';
+  }
+
+  fetchModelInfo();
+
   /* ---- Usage data & live charts ---- */
   var PALETTE = ['#6a55d6', '#2563c9', '#1f9d63', '#b5790a', '#cc3340', '#0891b2', '#c026d3'];
 
-  var chartByProject, chartByModel, chartByDay;
+  var chartByProject, chartByModel, chartByDay, chartLocalVsCloud;
+  var chartsReady = false; /* guard: are the Chart.js instances constructed yet? */
   var liveDot = document.getElementById('liveDot');
   var projectFilterSelect = document.getElementById('projectFilter');
 
-  /* Simple project label helper */
-  function projectLabel(workspaceRoot) {
-    var lastSlash = workspaceRoot.lastIndexOf('/');
-    return lastSlash >= 0 ? workspaceRoot.slice(lastSlash + 1) : workspaceRoot;
+  /* Create the three Chart.js instances ONCE (empty data to start); every
+   * subsequent poll/filter change only mutates .data and calls .update(),
+   * it never recreates them -- that's what avoids the flicker. */
+  function initCharts() {
+    if (chartsReady) return;
+    chartsReady = true;
+
+    chartByProject = new Chart(document.getElementById('chartByProject'), {
+      type: 'bar',
+      data: {
+        labels: [],
+        datasets: [
+          { label: 'Calls', data: [], backgroundColor: PALETTE[0] },
+          { label: 'Output tokens', data: [], backgroundColor: PALETTE[1], yAxisID: 'y1' },
+        ],
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: { title: { display: true, text: 'Calls & tokens by project' } },
+        scales: { y: { beginAtZero: true }, y1: { beginAtZero: true, position: 'right', grid: { drawOnChartArea: false } } },
+      },
+    });
+
+    chartByModel = new Chart(document.getElementById('chartByModel'), {
+      type: 'doughnut',
+      data: { labels: [], datasets: [{ data: [], backgroundColor: PALETTE }] },
+      options: { responsive: true, maintainAspectRatio: false, plugins: { title: { display: true, text: 'Calls by model' } } },
+    });
+
+    chartByDay = new Chart(document.getElementById('chartByDay'), {
+      type: 'line',
+      data: {
+        labels: [],
+        datasets: [{ label: 'Calls', data: [], borderColor: PALETTE[0], backgroundColor: PALETTE[0] + '33', fill: true, tension: 0.2 }],
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: { title: { display: true, text: 'Calls over time' } },
+        scales: { y: { beginAtZero: true } },
+      },
+    });
+
+    chartLocalVsCloud = new Chart(document.getElementById('chartLocalVsCloud'), {
+      type: 'bar',
+      data: {
+        labels: [],
+        datasets: [
+          { label: 'Local tokens (off-cloud)', data: [], backgroundColor: PALETTE[2] },
+          { label: 'Cloud tokens (in+out)', data: [], backgroundColor: PALETTE[4] },
+        ],
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: { title: { display: true, text: 'Local vs cloud tokens by project' } },
+        scales: { y: { beginAtZero: true } },
+      },
+    });
+  }
+
+  /* Called when the Usage panel first becomes visible (or re-visible after
+   * being on another tab) -- ensures charts exist and immediately applies
+   * whatever data has already been fetched by the initial /api/usage load or polls. */
+  function showTabUsage() {
+    initCharts();
+    /* Re-apply the latest raw records if any are available (they may have
+     * been loaded from /api/usage before we ever switched to Usage tab). */
+    applyUpdate(_rawRecords);
+  }
+
+  /* Project label helper -- the server resolves this per-record (via a
+   * git-repo-root walk, which needs filesystem access the browser doesn't
+   * have) and sends it as .project on every usage record / active task.
+   * Prefer that; the path-string fallback below only covers the unlikely
+   * case of a record missing it (older cached data, etc). */
+  function projectLabel(record) {
+    if (record && record.project) return record.project;
+    var workspaceRoot = (record && record.workspaceRoot) || '';
+    var parts = workspaceRoot.replace(/\\/+$/, '').split('/').filter(Boolean);
+    if (parts.length <= 1) return parts.join('/') || workspaceRoot;
+    return parts.slice(-2).join('/');
+  }
+
+  /* Format elapsed milliseconds to a human-readable string */
+  function formatElapsed(ms) {
+    var secs = Math.floor(ms / 1000);
+    if (secs < 60) return secs + 's';
+    var mins = Math.floor(secs / 60);
+    if (mins < 60) return mins + 'm ' + (secs % 60) + 's';
+    var hrs = Math.floor(mins / 60);
+    return hrs + 'h ' + (mins % 60) + 'm';
+  }
+
+  /* Format relative time (last used ago) */
+  function formatAgo(ms) {
+    if (ms < 60 * 1000) return Math.max(1, Math.ceil(ms / 60000)) + 'm ago';
+    var mins = Math.floor(ms / 60000);
+    if (mins < 60 * 24) return Math.floor(mins / 60) + 'h ago';
+    var hrs = Math.floor(mins / 60);
+    return Math.floor(hrs / 24) + 'd ago';
   }
 
   /* Build chart data from raw records (used for client-side re-aggregation) */
@@ -379,7 +728,7 @@ const APP_HTML = `<!doctype html>
 
     for (var i = 0; i < records.length; i++) {
       var r = records[i];
-      var project = projectLabel(r.workspaceRoot);
+      var project = projectLabel(r);
       var day = r.timestamp.slice(0, 10);
       if (r.success) totalSuccesses++; else totalFailures++;
       totalOutputTokens += r.outputTokens;
@@ -422,6 +771,7 @@ const APP_HTML = `<!doctype html>
 
   /* Update chart instances in-place */
   function updateCharts(filtered) {
+    if (!chartsReady) return;
     var bpData = filtered.byProject;
     var pLabels = bpData.map(function(p){ return p.project; });
     var cData = bpData.map(function(p){ return p.calls; });
@@ -451,11 +801,11 @@ const APP_HTML = `<!doctype html>
       var sid = r.sessionId || 'unknown';
       if (!bySessionMap.has(sid)) bySessionMap.set(sid, { sessionId: sid, calls: 0, outputTokens: 0, projects: new Set() });
       var s = bySessionMap.get(sid);
-      s.calls++; s.outputTokens += r.outputTokens; s.projects.add(projectLabel(r.workspaceRoot));
+      s.calls++; s.outputTokens += r.outputTokens; s.projects.add(projectLabel(r));
     }
 
     var sessionRows = [...bySessionMap.entries()]
-      .map(function(e){ var s = e[1]; return '<tr><td>' + s.sessionId.slice(0,8) + '…</td><td>' + s.calls + '</td><td>' + s.outputTokens.toLocaleString() + '</td><td>' + [...s.projects].join(', ') + '</td></tr>'; })
+      .map(function(e){ var s = e[1]; return '<tr><td>' + s.sessionId.slice(0,8) + '\u2026</td><td>' + s.calls + '</td><td>' + s.outputTokens.toLocaleString() + '</td><td>' + [...s.projects].join(', ') + '</td></tr>'; })
       .join('') || '<tr><td colspan="4">No usage yet.</td></tr>';
     document.getElementById('sessionTable').innerHTML = sessionRows;
 
@@ -463,7 +813,7 @@ const APP_HTML = `<!doctype html>
     var recentRows = recent.map(function(r){
       return '<tr>' +
         '<td>' + new Date(r.timestamp).toLocaleString() + '</td>' +
-        '<td>' + projectLabel(r.workspaceRoot) + '</td>' +
+        '<td>' + projectLabel(r) + '</td>' +
         '<td>' + r.model + '</td>' +
         '<td>' + r.think + '</td>' +
         '<td>' + r.toolCallSteps + '</td>' +
@@ -474,59 +824,367 @@ const APP_HTML = `<!doctype html>
     document.getElementById('recentTable').innerHTML = recentRows;
   }
 
-  /* Build project filter dropdown options */
+  /* Build project filter dropdown options from the FULL (unfiltered) record
+   * set -- always list every project, and keep whatever was selected before
+   * the rebuild (a poll/filter-change must not silently reset it). */
   function buildProjectFilter(allRecords) {
+    var current = projectFilterSelect.value || '__all__';
     var projects = new Set();
-    for (var i = 0; i < allRecords.length; i++) projects.add(projectLabel(allRecords[i].workspaceRoot));
+    for (var i = 0; i < allRecords.length; i++) projects.add(projectLabel(allRecords[i]));
     var opts = '<option value="__all__">All projects</option>';
     var sorted = Array.from(projects).sort();
     for (var j = 0; j < sorted.length; j++) {
       opts += '<option value="' + sorted[j] + '">' + sorted[j] + '</option>';
     }
     projectFilterSelect.innerHTML = opts;
+    projectFilterSelect.value = (current === '__all__' || sorted.indexOf(current) >= 0) ? current : '__all__';
   }
 
-  /* Apply the selected project filter and re-render everything */
-  function applyUpdate(records) {
-    var projectName = projectFilterSelect.value;
-    if (projectName && projectName !== '__all__') {
-      records = records.filter(function(r){ return projectLabel(r.workspaceRoot) === projectName; });
+  /* ---- Cloud (Claude Code) usage: aggregation + render, mirrors the local
+   * equivalents above but sourced from /api/cloud-usage's raw records. */
+  var _rawCloudRecords = [];
+
+  function buildCloudAgg(cloudRecords, projectFilterName) {
+    var filtered = (projectFilterName && projectFilterName !== '__all__')
+      ? cloudRecords.filter(function(r){ return r.project === projectFilterName; })
+      : cloudRecords;
+
+    var byProjectMap = new Map();
+    var totalInputTokens = 0, totalOutputTokens = 0;
+    for (var i = 0; i < filtered.length; i++) {
+      var r = filtered[i];
+      totalInputTokens += r.inputTokens;
+      totalOutputTokens += r.outputTokens;
+      if (!byProjectMap.has(r.project)) byProjectMap.set(r.project, { calls: 0, inputTokens: 0, outputTokens: 0 });
+      var p = byProjectMap.get(r.project);
+      p.calls++; p.inputTokens += r.inputTokens; p.outputTokens += r.outputTokens;
     }
-    buildProjectFilter(records); /* rebuild to only show current projects */
+
+    return {
+      totalCalls: filtered.length,
+      totalInputTokens: totalInputTokens,
+      totalOutputTokens: totalOutputTokens,
+      totalCloudTokens: totalInputTokens + totalOutputTokens,
+      byProject: [...byProjectMap.entries()].map(function(e){
+        var k = e[0], v = e[1];
+        return { project: k, calls: v.calls, inputTokens: v.inputTokens, outputTokens: v.outputTokens };
+      }),
+    };
+  }
+
+  function renderCloudStats(cloudAgg) {
+    var el = document.getElementById('cloudStatCards');
+    if (!el) return;
+    el.innerHTML =
+      '<div class="stat"><span class="n">' + cloudAgg.totalCalls.toLocaleString() + '</span><span class="l">Cloud messages</span></div>' +
+      '<div class="stat"><span class="n">' + cloudAgg.totalInputTokens.toLocaleString() + '</span><span class="l">Input tokens</span></div>' +
+      '<div class="stat"><span class="n">' + cloudAgg.totalOutputTokens.toLocaleString() + '</span><span class="l">Output tokens</span></div>' +
+      '<div class="stat highlight"><span class="n">' + cloudAgg.totalCloudTokens.toLocaleString() + '</span><span class="l">Total cloud tokens</span></div>';
+  }
+
+  /* Update the "local vs cloud tokens by project" comparison chart in place.
+   * Unions project names from both sides -- a project delegated locally but
+   * never touched by Claude directly (or vice versa) still gets a bar,
+   * with 0 for whichever side has no data. */
+  function updateLocalVsCloudChart(localAgg, cloudAgg) {
+    if (!chartsReady) return;
+    var localMap = {};
+    for (var i = 0; i < localAgg.byProject.length; i++) {
+      var lp = localAgg.byProject[i];
+      localMap[lp.project] = lp.outputTokens + lp.promptTokens;
+    }
+    var cloudMap = {};
+    for (var j = 0; j < cloudAgg.byProject.length; j++) {
+      var cp = cloudAgg.byProject[j];
+      cloudMap[cp.project] = cp.inputTokens + cp.outputTokens;
+    }
+
+    var allProjects = new Set(Object.keys(localMap).concat(Object.keys(cloudMap)));
+    var sorted = Array.from(allProjects).sort();
+
+    chartLocalVsCloud.data.labels = sorted;
+    chartLocalVsCloud.data.datasets[0].data = sorted.map(function(p){ return localMap[p] || 0; });
+    chartLocalVsCloud.data.datasets[1].data = sorted.map(function(p){ return cloudMap[p] || 0; });
+    chartLocalVsCloud.update('none');
+  }
+
+  /* Apply the selected project filter and re-render everything. "rawRecords"
+   * is always the FULL unfiltered list from the server -- filtering for
+   * display happens in here, never destructively on the stored list. */
+  function applyUpdate(rawRecords) {
+    buildProjectFilter(rawRecords); /* always reflects every known project */
+    var projectName = projectFilterSelect.value;
+    var records = (projectName && projectName !== '__all__')
+      ? rawRecords.filter(function(r){ return projectLabel(r) === projectName; })
+      : rawRecords;
     var agg = buildAgg(records);
     renderStats(agg);
+
+    var cloudAgg = buildCloudAgg(_rawCloudRecords, projectName);
+    renderCloudStats(cloudAgg);
 
     if (!agg.totalCalls) {
       document.getElementById('sessionTable').innerHTML = '<tr><td colspan="4">No usage yet.</td></tr>';
       document.getElementById('recentTable').innerHTML = '<tr><td colspan="8">No usage yet.</td></tr>';
-      chartByProject.data.labels = []; chartByProject.data.datasets[0].data = []; chartByProject.data.datasets[1].data = [];
-      chartByModel.data.labels = []; chartByModel.data.datasets[0].data = [];
-      chartByDay.data.labels = []; chartByDay.data.datasets[0].data = [];
-      chartByProject.update('none');
-      chartByModel.update('none');
-      chartByDay.update('none');
-      return;
+      if (chartsReady) {
+        chartByProject.data.labels = []; chartByProject.data.datasets[0].data = []; chartByProject.data.datasets[1].data = [];
+        chartByModel.data.labels = []; chartByModel.data.datasets[0].data = [];
+        chartByDay.data.labels = []; chartByDay.data.datasets[0].data = [];
+        chartByProject.update('none');
+        chartByModel.update('none');
+        chartByDay.update('none');
+      }
+    } else {
+      updateCharts(agg);
+      renderTables(records, agg);
     }
 
-    updateCharts(agg);
-    renderTables(records, agg);
+    /* Local-vs-cloud comparison chart updates regardless of whether local
+     * has any calls -- a project can be cloud-only (no delegations yet). */
+    updateLocalVsCloudChart(agg, cloudAgg);
   }
 
-  /* Initial load */
+  /* ---- Active tab state (declared early so the initial-url-detection code
+   * below can safely reference it if /active is loaded) ---- */
+  var activeLiveDot = document.getElementById('activeLiveDot');
+  var _activeTasks = [];
+  var _allKnownProjects = {}; /* project -> { lastUsed: ISO string } */
+  var _detailTaskId = null;
+
+  /* Refresh active-tab data by polling /api/active + merging with usage data */
+  function refreshActiveTab() {
+    fetch('/api/active').then(function(r) { return r.json(); }).then(function(data) {
+      _activeTasks = data || [];
+
+      /* Also merge in known projects from the usage API for idle status */
+      if (_allKnownProjects === undefined || Object.keys(_allKnownProjects).length === 0 && _rawRecords.length > 0) {
+        for (var i = 0; i < _rawRecords.length; i++) {
+          var proj = projectLabel(_rawRecords[i]);
+          if (!_allKnownProjects[proj]) {
+            _allKnownProjects[proj] = { lastUsed: _rawRecords[i].timestamp };
+          } else {
+            if (_rawRecords[i].timestamp > _allKnownProjects[proj].lastUsed) {
+              _allKnownProjects[proj].lastUsed = _rawRecords[i].timestamp;
+            }
+          }
+        }
+      }
+
+      renderProjectStatus();
+
+      /* Update detail panel if one is open */
+      if (_detailTaskId) {
+        updateDetailPanel(_detailTaskId);
+      }
+
+      var hasActive = _activeTasks.length > 0;
+      activeLiveDot.style.display = hasActive ? 'inline-block' : 'none';
+    }).catch(function() { /* ignore poll errors */ });
+  }
+
+  /* Render the per-project status table */
+  function renderProjectStatus() {
+    var tbody = document.getElementById('projectStatusTable');
+    if (!tbody) return;
+
+    var allProjects = new Set();
+
+    /* Collect from active tasks */
+    for (var i = 0; i < _activeTasks.length; i++) {
+      allProjects.add(projectLabel(_activeTasks[i]));
+    }
+
+    /* Collect from known projects */
+    for (var k in _allKnownProjects) {
+      if (_allKnownProjects.hasOwnProperty(k)) allProjects.add(k);
+    }
+
+    var now = Date.now();
+    var rows = [];
+
+    var sorted = Array.from(allProjects).sort();
+    for (var j = 0; j < sorted.length; j++) {
+      var proj = sorted[j];
+      /* Find the active task for this project */
+      var activeTask = null;
+      for (var i = 0; i < _activeTasks.length; i++) {
+        if (projectLabel(_activeTasks[i]) === proj) {
+          activeTask = _activeTasks[i];
+          break;
+        }
+      }
+
+      var statusHtml, agoHtml;
+      if (activeTask) {
+        statusHtml = '<span class="status-badge">\\ud83d\\udfe2 running \\u2014 ' + formatElapsed(activeTask.elapsedMs) + '</span>';
+        agoHtml = '\u2014';
+      } else if (_allKnownProjects[proj]) {
+        var lastUsed = new Date(_allKnownProjects[proj].lastUsed).getTime();
+        var ago = now - lastUsed;
+        statusHtml = '<span class="status-badge">\\u26aa idle</span>';
+        agoHtml = formatAgo(ago);
+      } else {
+        statusHtml = '<span class="status-badge">\\u26aa idle</span>';
+        agoHtml = '\u2014';
+      }
+
+      rows.push('<tr class="project-row"' + (activeTask ? ' data-task-id="' + activeTask.id + '"' : '') + '>' +
+        '<td>' + proj + '</td>' +
+        '<td>' + statusHtml + '</td>' +
+        '<td class="elapsed-text">' + agoHtml + '</td></tr>');
+    }
+
+    if (rows.length === 0) {
+      rows.push('<tr><td colspan="3">No usage yet.</td></tr>');
+    }
+
+    tbody.innerHTML = rows.join('');
+
+    /* Attach click handlers to running projects */
+    var rowEls = tbody.querySelectorAll('.project-row[data-task-id]');
+    for (var r = 0; r < rowEls.length; r++) {
+      rowEls[r].addEventListener('click', function() {
+        var id = this.getAttribute('data-task-id');
+        showDetail(id);
+      });
+    }
+  }
+
+  /* Show the detail panel for a running task */
+  function showDetail(taskId) {
+    _detailTaskId = taskId;
+    var panel = document.getElementById('activeDetail');
+    if (panel) panel.classList.add('visible');
+    updateDetailPanel(taskId);
+  }
+
+  function hideDetail() {
+    _detailTaskId = null;
+    var panel = document.getElementById('activeDetail');
+    if (panel) panel.classList.remove('visible');
+  }
+
+  function updateDetailPanel(taskId) {
+    var task = null;
+    for (var i = 0; i < _activeTasks.length; i++) {
+      if (_activeTasks[i].id === taskId) { task = _activeTasks[i]; break; }
+    }
+    if (!task) return;
+
+    var titleEl = document.getElementById('activeDetailTitle');
+    var elapsedEl = document.getElementById('activeDetailElapsed');
+    var stepsEl = document.getElementById('activeDetailSteps');
+
+    if (titleEl) titleEl.textContent = projectLabel(task);
+    if (elapsedEl) elapsedEl.textContent = 'Elapsed: ' + formatElapsed(task.elapsedMs) + ' \\u2014 Model: ' + task.model + (task.think ? ' (thinking)' : '');
+
+    var steps = task.steps || [];
+    var stepHtmls = [];
+    for (var i = 0; i < steps.length; i++) {
+      var ts = new Date(steps[i].timestamp);
+      var timeStr = ts.toLocaleTimeString('en-US', { hour12: false });
+      stepHtmls.push('<li><span style="color:#888">' + timeStr + '</span> \u2014 ' + escapeHtml(steps[i].message) + '</li>');
+    }
+
+    if (stepHtmls.length === 0) {
+      stepHtmls = ['<li style="color:#888">Waiting for first step\u2026</li>'];
+    }
+
+    if (stepsEl) stepsEl.innerHTML = stepHtmls.join('');
+
+    /* Auto-scroll to bottom */
+    if (stepsEl) {
+      stepsEl.scrollTop = stepsEl.scrollHeight;
+    }
+  }
+
+  function escapeHtml(s) {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  /* Active tab initialization -- only runs when the tab is first shown */
+  var _activeInitialized = false;
+
+  function initActiveTab() {
+    if (_activeInitialized) return;
+    _activeInitialized = true;
+
+    /* Close handler */
+    document.getElementById('activeDetailClose').addEventListener('click', hideDetail);
+
+    /* Initial render using whatever usage data we already have */
+    refreshProjectListFromUsage();
+
+    /* Start fast polling for active tasks (separate from the 5s usage poll) */
+    startActivePolling();
+  }
+
+  function refreshProjectListFromUsage() {
+    if (_rawRecords.length > 0) {
+      for (var i = 0; i < _rawRecords.length; i++) {
+        var proj = projectLabel(_rawRecords[i]);
+        if (!_allKnownProjects[proj]) {
+          _allKnownProjects[proj] = { lastUsed: _rawRecords[i].timestamp };
+        } else {
+          if (_rawRecords[i].timestamp > _allKnownProjects[proj].lastUsed) {
+            _allKnownProjects[proj].lastUsed = _rawRecords[i].timestamp;
+          }
+        }
+      }
+    }
+  }
+
+  var _activePollTimer = null;
+  function startActivePolling() {
+    if (_activePollTimer) return;
+    (function poll() {
+      refreshActiveTab();
+      _activePollTimer = setTimeout(poll, 2000);
+    })();
+  }
+
+  /* ---- Usage data polling (existing) ---- */
   var _rawRecords = []; /* store for table rendering */
-  fetch('/api/usage').then(function(r){ return r.json(); }).then(function(data) {
+
+  function fetchUsageAndCloud() {
+    return Promise.all([
+      fetch('/api/usage').then(function(r){ return r.json(); }),
+      /* Cloud usage is best-effort -- if it 404s on an older server or the
+       * transcript scan hiccups, fall back to empty rather than breaking
+       * the whole Usage tab. */
+      fetch('/api/cloud-usage').then(function(r){ return r.json(); }).catch(function(){ return { records: [] }; }),
+    ]);
+  }
+
+  fetchUsageAndCloud().then(function(results) {
+    var data = results[0];
+    var cloudData = results[1];
     _rawRecords = data.records || [];
+    _rawCloudRecords = cloudData.records || [];
+
+    /* Rebuild the known-projects map so Active tab can merge with /api/active */
+    refreshProjectListFromUsage();
+
     buildProjectFilter(_rawRecords);
     applyUpdate(_rawRecords);
+    renderModelInfoCard(); /* recompute avg tok/s now that usage records are in */
 
     projectFilterSelect.addEventListener('change', function() { applyUpdate(_rawRecords); });
 
     /* Live poll every 5 seconds */
     (function poll() {
-      fetch('/api/usage').then(function(r){ return r.json(); }).then(function(data) {
+      fetchUsageAndCloud().then(function(results) {
+        var data = results[0];
+        var cloudData = results[1];
         _rawRecords = data.records || [];
+        _rawCloudRecords = cloudData.records || [];
+
+        /* Rebuild known-projects map so Active tab stays current */
+        refreshProjectListFromUsage();
+
         var currentVal = projectFilterSelect.value;
         applyUpdate(_rawRecords); /* re-apply the currently-selected filter */
+        renderModelInfoCard(); /* keep avg tok/s current as new local calls land */
 
         if (_rawRecords.length > 0 || true) {
           liveDot.style.display = 'inline-block';
@@ -538,6 +1196,14 @@ const APP_HTML = `<!doctype html>
 
     liveDot.style.display = 'inline-block';
   });
+
+  /* Determine which tab to start on based on URL -- now that every Usage-tab
+   * variable/function above is defined, it's safe for this to synchronously
+   * trigger showTabUsage() via showTab('usage'). */
+  if (location.pathname === '/usage') showTab('usage', false);
+  else if (location.pathname === '/active') showTab('active', false);
+  else showTab('config', false);
+
 })();
 </script>
 `;
