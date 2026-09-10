@@ -1,5 +1,15 @@
 # local-worker-mcp
 
+> **Status (2026-09-10):** kept as our own custom delegation tool, but
+> **not the default anymore** -- [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
+> (`dsh --profile worker "<task>"`) is, after a head-to-head benchmark on
+> the same task/model showed its real `bash`/`fs` tools verify their own
+> work more reliably out of the box. See `~/local-llm-bench` for the
+> comparison and `tools/claude-hooks/README.md` for the delegation
+> guardrail that now points at `dsh` first. This server is still useful
+> for cases dsh doesn't fit, and got a `run_script` tool added as a direct
+> result of that benchmark (closing the verification gap it found).
+
 An MCP server that exposes a local Ollama model (e.g. Qwen3.6) as an
 **agentic worker** -- with its own tool-calling loop (read/list/write
 files inside an allow-listed folder, search the web, get the real current

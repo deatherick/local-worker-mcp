@@ -58,6 +58,27 @@ export function buildToolDefs(webSearchEnabled: boolean) {
     {
       type: "function",
       function: {
+        name: "run_script",
+        description:
+          "Run a script file you already wrote (via write_file) using an allow-listed interpreter -- " +
+          `${Object.keys(ALLOWED_INTERPRETERS).join(", ")}. Use this to actually verify non-npm/TS projects ` +
+          "(Python, plain Node scripts, etc.) instead of guessing that code works. This does NOT run arbitrary " +
+          "shell commands or shell strings -- only 'interpreter <script_path> [args...]', no pipes, no &&, no " +
+          `shell expansion. Capped at ${MAX_SCRIPT_RUNS_PER_TASK} uses per task.`,
+        parameters: {
+          type: "object",
+          properties: {
+            interpreter: { type: "string", enum: Object.keys(ALLOWED_INTERPRETERS) },
+            script_path: { type: "string", description: "Path to the script, relative to workspace_root." },
+            args: { type: "array", items: { type: "string" }, description: "Optional plain arguments passed to the script." },
+          },
+          required: ["interpreter", "script_path"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
         name: "run_checks",
         description:
           "Verify your own work by running project checks (build / typecheck / test) inside workspace_root. " +
@@ -103,6 +124,21 @@ const ALLOWED_CHECKS: Record<string, { cmd: string; args: string[]; timeoutMs: n
   test: { cmd: "npm", args: ["test"], timeoutMs: 120_000 },
 };
 
+// The gap this closes: run_checks only knows npm/TS. A benchmark head-to-head
+// against DeepSeek Harness's real `bash` tool (2026-09-10) showed the worker
+// writing correct Python, then burning its whole run_checks budget retrying
+// `npm run build` against a project with no package.json, and finally telling
+// the HUMAN to verify it manually instead of ever running the code itself.
+// run_script fixes that without opening arbitrary shell: fixed interpreter
+// allow-list, no shell string, script_path resolved through the same
+// resolveSafePath as every other file tool.
+export const MAX_SCRIPT_RUNS_PER_TASK = 4;
+const ALLOWED_INTERPRETERS: Record<string, { cmd: string; timeoutMs: number }> = {
+  python3: { cmd: "python3", timeoutMs: 60_000 },
+  node: { cmd: "node", timeoutMs: 60_000 },
+  ruby: { cmd: "ruby", timeoutMs: 60_000 },
+};
+
 export interface ToolContext {
   config: WorkerConfig;
   workspaceRoot: string;
@@ -112,6 +148,7 @@ export interface ToolContext {
   // the outer tool-calling loop is a backstop too, but this gives a much
   // tighter, purpose-specific limit and a clearer message when it's hit.
   checksUsed: { count: number };
+  scriptRunsUsed: { count: number };
 }
 
 export async function executeTool(name: string, args: any, ctx: ToolContext): Promise<string> {
@@ -141,6 +178,9 @@ export async function executeTool(name: string, args: any, ctx: ToolContext): Pr
     }
     case "run_checks": {
       return await runChecks(args.checks, ctx);
+    }
+    case "run_script": {
+      return await runScript(args.interpreter, args.script_path, args.args || [], ctx);
     }
     default:
       throw new Error(`Unknown tool: ${name}`);
@@ -181,6 +221,55 @@ async function runChecks(checks: string[], ctx: ToolContext): Promise<string> {
 
   appendLog(`RUN_CHECKS [${checks.join(",")}] workspace_root=${ctx.workspaceRoot} (use ${ctx.checksUsed.count}/${MAX_CHECKS_PER_TASK})`);
   return results.join("\n\n");
+}
+
+async function runScript(interpreter: string, scriptPath: string, scriptArgs: string[], ctx: ToolContext): Promise<string> {
+  ctx.scriptRunsUsed.count++;
+  if (ctx.scriptRunsUsed.count > MAX_SCRIPT_RUNS_PER_TASK) {
+    return (
+      `ERROR: run_script has already been called ${ctx.scriptRunsUsed.count - 1} times this task ` +
+      `(limit ${MAX_SCRIPT_RUNS_PER_TASK}). Stop retrying the same fix -- report the current failure and stop.`
+    );
+  }
+
+  const spec = ALLOWED_INTERPRETERS[interpreter];
+  if (!spec) {
+    return `ERROR: unknown interpreter "${interpreter}" (allowed: ${Object.keys(ALLOWED_INTERPRETERS).join(", ")})`;
+  }
+  if (typeof scriptPath !== "string" || !scriptPath.trim()) {
+    return "ERROR: script_path is required";
+  }
+  if (!scriptArgs.every((a) => typeof a === "string")) {
+    return "ERROR: args must be plain strings";
+  }
+
+  // resolveSafePath both confines the script to workspace_root/allowedRoots
+  // AND rejects it if it doesn't exist as a real file -- same guarantee
+  // read_file already relies on, so a model can't point this at anything
+  // outside its sandbox.
+  const absPath = resolveSafePath(ctx.config, ctx.workspaceRoot, scriptPath);
+  if (!fs.existsSync(absPath)) {
+    return `ERROR: script not found at ${scriptPath}`;
+  }
+
+  const root = resolveSafePath(ctx.config, ctx.workspaceRoot, ".");
+  try {
+    // execFile, never a shell string -- args after the script path are
+    // passed as an argv array, so there is no pipe/&&/expansion surface
+    // even though the model chooses their content.
+    const { stdout, stderr } = await execFileAsync(spec.cmd, [absPath, ...scriptArgs], {
+      cwd: root,
+      timeout: spec.timeoutMs,
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    const output = (stdout + stderr).trim();
+    appendLog(`RUN_SCRIPT ${interpreter} ${scriptPath} workspace_root=${ctx.workspaceRoot} (use ${ctx.scriptRunsUsed.count}/${MAX_SCRIPT_RUNS_PER_TASK}) -> PASS`);
+    return `PASS (exit 0)${output ? "\n" + truncate(output) : ""}`;
+  } catch (e: any) {
+    const output = ((e.stdout || "") + (e.stderr || "") || e.message || String(e)).trim();
+    appendLog(`RUN_SCRIPT ${interpreter} ${scriptPath} workspace_root=${ctx.workspaceRoot} (use ${ctx.scriptRunsUsed.count}/${MAX_SCRIPT_RUNS_PER_TASK}) -> FAIL`);
+    return `FAIL (exit ${e.code ?? "?"})\n${truncate(output)}`;
+  }
 }
 
 function truncate(s: string, max = 4000): string {

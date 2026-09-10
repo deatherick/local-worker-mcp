@@ -39,7 +39,7 @@ export async function runDelegatedTask(config: WorkerConfig, params: RunTaskPara
   const think = params.think ?? config.defaultThink;
   const maxSteps = params.maxSteps ?? 8;
   const tools = buildToolDefs(config.webSearchEnabled);
-  const ctx: ToolContext = { config, workspaceRoot: params.workspaceRoot, checksUsed: { count: 0 } };
+  const ctx: ToolContext = { config, workspaceRoot: params.workspaceRoot, checksUsed: { count: 0 }, scriptRunsUsed: { count: 0 } };
 
   const messages: any[] = [
     {
@@ -56,7 +56,7 @@ export async function runDelegatedTask(config: WorkerConfig, params: RunTaskPara
     const payload: any = {
       model,
       stream: false,
-      keep_alive: 60, // stay warm across steps of the same task; caller's next delegate_task call unloads via a trailing 0-keepalive ping if desired
+      keep_alive: 600, // 10 min -- covers gaps between delegate_task calls during active back-and-forth review; a longer gap means development actually paused, so it's fine to unload and eat the ~3.2s reload cost next time
       messages,
       tools,
       options: { num_ctx: config.defaultCtx, num_predict: config.defaultMaxTokens },
@@ -85,7 +85,8 @@ export async function runDelegatedTask(config: WorkerConfig, params: RunTaskPara
 
     messages.push({ role: "assistant", content: msg.content || "", tool_calls: msg.tool_calls });
 
-    for (const call of msg.tool_calls) {
+    for (let callIdx = 0; callIdx < msg.tool_calls.length; callIdx++) {
+      const call = msg.tool_calls[callIdx];
       const toolName = call.function.name;
       let args = call.function.arguments;
       if (typeof args === "string") {
@@ -95,7 +96,13 @@ export async function runDelegatedTask(config: WorkerConfig, params: RunTaskPara
           /* leave as-is, executeTool will likely fail loudly, which is fine */
         }
       }
-      params.onProgress?.(`Step ${step + 1}/${maxSteps}: running tool "${toolName}"...`);
+      // A single model turn ("step") can batch several tool calls at once --
+      // without the sub-index here, the progress log showed the same "Step
+      // N/maxSteps" label repeated once per tool call, which reads as if the
+      // task were stuck on step N instead of actively working through it.
+      params.onProgress?.(
+        `Step ${step + 1}/${maxSteps} \u00b7 tool call ${callIdx + 1}/${msg.tool_calls.length}: running "${toolName}"...`
+      );
       let result: string;
       try {
         result = await executeTool(toolName, args, ctx);

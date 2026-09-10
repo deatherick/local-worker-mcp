@@ -1,9 +1,19 @@
 # classify-edit-size.py
 
 A `PreToolUse` guardrail hook for Claude Code: blocks direct `Edit`/`Write`
-calls that look like new implementation work, forcing that work through
-`delegate_task` on `local-worker-mcp` instead. Small fixes to existing code
-pass through untouched.
+calls that look like new implementation work, forcing that work through a
+delegated worker instead of Claude coding it directly. Small fixes to
+existing code pass through untouched.
+
+Default delegation target (2026-09-10 onward): **DeepSeek Harness**
+(`dsh --profile worker "<task>"`, open-source, run against our local Ollama
+models -- see `~/.dsh/profiles/worker`). `local-worker-mcp`'s `delegate_task`
+is still available as our own custom tool, mentioned as a fallback in the
+hook's denial message, but isn't the first thing Claude reaches for anymore
+-- a head-to-head benchmark on the same task/model
+(`~/local-llm-bench`) showed dsh's real `bash`/`fs` tools verify their own
+work more reliably out of the box than our narrower `run_checks` (fixed
+after that finding to add a `run_script` tool, but dsh remains the default).
 
 Not applied to this repo itself -- it lived here only as a test while
 building it. Install it into any other project you want to enforce

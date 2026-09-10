@@ -2,8 +2,16 @@
 """
 PreToolUse hook for Edit|Write in this project: blocks direct edits that
 look like NEW IMPLEMENTATION work (lots of added/changed lines), forcing
-that work through the local-worker MCP's delegate_task instead. Small
-fixes to existing code pass through untouched.
+that work through a delegated worker instead of Claude coding it directly.
+Small fixes to existing code pass through untouched.
+
+Default delegation target (2026-09-10 onward): DeepSeek Harness, run
+against our local Ollama models -- `dsh --profile worker "<task>"` (see
+~/.dsh/profiles/worker). local-worker-mcp's `delegate_task` is still
+available as our own custom tool for cases dsh doesn't cover well, but
+isn't the first thing to reach for anymore -- a head-to-head benchmark on
+the same task/model showed dsh's real `bash`/`fs` tools verify their own
+work more reliably out of the box.
 
 This is a deterministic heuristic (line-diff size), not an LLM judgment
 call -- chosen specifically so it's provable: same input always gives the
@@ -70,8 +78,10 @@ def main():
                 "permissionDecision": "deny",
                 "permissionDecisionReason": (
                     f"This {tool_name} changes ~{changed} lines (limit {LINES_THRESHOLD}) -- looks like new "
-                    "implementation work, not a small fix. Delegate this to the local-worker MCP's "
-                    "delegate_task instead of editing it directly. If this really is just a fix (e.g. a "
+                    "implementation work, not a small fix. Delegate this instead of editing it directly: "
+                    "run `dsh --profile worker \"<self-contained task description>\"` via Bash (default -- "
+                    "DeepSeek Harness against our local Ollama models), or use the local-worker MCP's "
+                    "delegate_task if dsh doesn't fit this case. If this really is just a fix (e.g. a "
                     "large but simple rename), do it as several smaller Edit calls, or ask the user to "
                     "raise LINES_THRESHOLD in .claude/hooks/classify-edit-size.py."
                 ),

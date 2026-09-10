@@ -29,7 +29,7 @@ export interface WorkerConfig {
 export const DEFAULT_CONFIG: WorkerConfig = {
   port: 8787,
   ollamaHost: "http://localhost:11434",
-  defaultModel: "qwen3.6:35b-a3b",
+  defaultModel: "ornith:35b",
   defaultThink: false,
   defaultCtx: 32768,
   defaultMaxTokens: 4096,
